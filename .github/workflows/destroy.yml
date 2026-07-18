@@ -17,7 +17,7 @@ jobs:
 
       - name: Terraform Init
         run: |
-          terraform init \
+          terraform init -reconfigure \
             -reconfigure \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=myshortner02/terraform.tfstate" \
