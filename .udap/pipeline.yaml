@@ -1,0 +1,81 @@
+version: 1
+name: myshortner02
+vcs: github
+
+stages:
+  - id: lint
+    kind: lint
+    needs: []
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install flake8
+        run: pip install flake8
+      - name: Run flake8
+        run: flake8 app/ --max-line-length=120 --exclude=app/migrations
+
+  - id: provision
+    kind: provision
+    needs: [lint]
+    steps:
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+      - name: Terraform Init
+        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=myshortner02/terraform.tfstate" -backend-config="region=us-east-1"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        working-directory: infra
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -var="db_password=${{ secrets.DB_PASSWORD }}" -var="project_name=${{ secrets.PROJECT_NAME }}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        working-directory: infra
+      - name: Capture Outputs
+        id: tf_outputs
+        run: |
+          echo "ec2_ip=$(terraform output -raw ec2_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> "$GITHUB_OUTPUT"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        working-directory: infra
+
+  - id: configure
+    kind: configure
+    needs: [provision]
+    steps:
+      - name: Install Ansible
+        run: pip install ansible
+      - name: Write SSH key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+      - name: Scan host key
+        run: ssh-keyscan -H ${{ needs.provision.outputs.ec2_ip }} >> ~/.ssh/known_hosts
+      - name: Run Ansible playbook
+        run: |
+          ansible-playbook -i "${{ needs.provision.outputs.ec2_ip }}," \
+            --private-key /tmp/deploy_key \
+            -u ${{ secrets.SSH_USER }} \
+            -e "rds_endpoint=${{ needs.provision.outputs.rds_endpoint }}" \
+            -e "db_password=${{ secrets.DB_PASSWORD }}" \
+            -e "project_name=${{ secrets.PROJECT_NAME }}" \
+            ansible/playbook.yml
+
+  - id: verify
+    kind: verify
+    needs: [configure]
+    steps:
+      - name: Health check
+        run: |
+          curl --fail --retry 10 --retry-delay 15 --retry-all-errors \
+            http://${{ needs.provision.outputs.ec2_ip }}/health
+
+rollback:
+  strategy: manual

@@ -1,0 +1,131 @@
+---
+- name: Configure URL Shortener on EC2
+  hosts: all
+  become: true
+
+  vars:
+    app_dir: /opt/shortener
+    venv_dir: /opt/shortener/venv
+    app_user: ec2-user
+
+  tasks:
+    - name: Update all packages
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        update_cache: true
+
+    - name: Install Python 3.12, pip, git, nginx
+      ansible.builtin.dnf:
+        name:
+          - python3.12
+          - python3.12-pip
+          - git
+          - nginx
+        state: present
+
+    - name: Create app directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Copy application code
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+        directory_mode: "0755"
+        exclude:
+          - ".git"
+          - ".github"
+          - "infra"
+          - "ansible"
+          - "__pycache__"
+          - "*.pyc"
+
+    - name: Create Python virtual environment
+      ansible.builtin.command:
+        cmd: python3.12 -m venv {{ venv_dir }}
+        creates: "{{ venv_dir }}/bin/activate"
+
+    - name: Install Python dependencies
+      ansible.builtin.pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_python: python3.12
+
+    - name: Write .env file
+      ansible.builtin.copy:
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0600"
+        content: |
+          DB_HOST={{ rds_endpoint }}
+          DB_PORT=5432
+          DB_NAME=shortener
+          DB_USER=shortener
+          DB_PASSWORD={{ db_password }}
+          BASE_URL=http://{{ ansible_host }}
+
+    - name: Write systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/shortener.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=URL Shortener (FastAPI)
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ venv_dir }}/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Write nginx config
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/shortener.conf
+        mode: "0644"
+        content: |
+          server {
+              listen 80 default_server;
+              server_name _;
+
+              location / {
+                  proxy_pass         http://127.0.0.1:8000;
+                  proxy_set_header   Host $host;
+                  proxy_set_header   X-Real-IP $remote_addr;
+                  proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_read_timeout 60s;
+              }
+          }
+
+    - name: Remove default nginx config
+      ansible.builtin.file:
+        path: /etc/nginx/conf.d/default.conf
+        state: absent
+
+    - name: Enable and start nginx
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    - name: Enable and restart shortener service
+      ansible.builtin.systemd:
+        name: shortener
+        enabled: true
+        state: restarted
+        daemon_reload: true

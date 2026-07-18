@@ -1,0 +1,10 @@
+# udap:meta cloud=aws region=us-east-1 target=ec2
+
+user: Internet User { shape: rectangle; udap-type: generic.user }
+vpc: Default VPC {
+  ec2: App Server (EC2 t3.small) { shape: rectangle; udap-type: aws.ec2 }
+  rds: PostgreSQL 15 (RDS t3.micro) { shape: rectangle; udap-type: aws.rds }
+}
+
+user -> vpc.ec2: HTTPS / HTTP (port 80)
+vpc.ec2 -> vpc.rds: SQL (port 5432)
