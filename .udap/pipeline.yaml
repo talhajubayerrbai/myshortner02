@@ -27,7 +27,7 @@ stages:
         with:
           terraform_version: "1.7.5"
       - name: Terraform Init
-        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=myshortner02/terraform.tfstate" -backend-config="region=us-east-1"
+        run: terraform init -reconfigure -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=myshortner02/terraform.tfstate" -backend-config="region=us-east-1"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
