@@ -34,7 +34,7 @@ jobs:
         with:
           terraform_version: "1.7.5"
       - name: Terraform Init
-        run: terraform init -reconfigure -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=myshortner02/terraform.tfstate" -backend-config="region=us-east-1"
+        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=myshortner02/terraform.tfstate" -backend-config="region=us-east-1"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -65,8 +65,8 @@ jobs:
           RDS_EP=$(terraform output -json | jq -r '.rds_endpoint.value')
           echo "ec2_ip=${EC2_IP}" >> "$GITHUB_OUTPUT"
           echo "ec2_id=${EC2_ID}" >> "$GITHUB_OUTPUT"
-          # Write RDS endpoint to artifact file — GitHub masks job outputs that
-          # contain substrings matching registered secrets.
+          # Write RDS endpoint to artifact file — GitHub masks job outputs
+          # that contain substrings matching registered secrets.
           echo -n "${RDS_EP}" > /tmp/rds_endpoint.txt
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -92,17 +92,7 @@ jobs:
         with:
           name: rds-endpoint
           path: /tmp
-      - name: Write SSH key
-        run: |
-          install -m 600 /dev/null /tmp/deploy_key
-          printf '%s\n' "$SSH_PRIVATE_KEY" > /tmp/deploy_key
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-      - name: Inject SSH public key via SSM (authoritative, no SSH needed)
-        # This step uses AWS SSM Run Command to write the current SSH_PUBLIC_KEY
-        # into ec2-user's authorized_keys on the running instance.
-        # This works regardless of what key the instance was launched with and
-        # does not require SSH connectivity — only SSM agent (pre-installed on AL2023).
+      - name: Inject SSH public key via SSM
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -112,7 +102,6 @@ jobs:
           INSTANCE_ID="${{ needs.provision.outputs.ec2_id }}"
           echo "Injecting SSH public key into instance $INSTANCE_ID via SSM"
 
-          # Wait for SSM agent to be reachable (it may be starting up)
           for i in $(seq 1 20); do
             STATUS=$(aws ssm describe-instance-information \
               --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
@@ -124,30 +113,23 @@ jobs:
           done
 
           if [ "$STATUS" != "Online" ]; then
-            echo "ERROR: SSM agent not online after 5 minutes"
+            echo "ERROR: SSM agent not online"
             exit 1
           fi
 
-          # Encode the public key as base64 to safely pass it as a command argument
+          # Write pub key to a temp file, upload via SSM parameter store to avoid
+          # shell quoting issues with base64 expansion inside SSM JSON
           B64_KEY=$(printf '%s' "$SSH_PUBLIC_KEY" | base64 -w0)
 
           CMD_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
             --document-name "AWS-RunShellScript" \
-            --parameters "commands=[
-              'mkdir -p /home/ec2-user/.ssh',
-              'chmod 700 /home/ec2-user/.ssh',
-              'echo ${B64_KEY} | base64 -d > /home/ec2-user/.ssh/authorized_keys',
-              'chmod 600 /home/ec2-user/.ssh/authorized_keys',
-              'chown -R ec2-user:ec2-user /home/ec2-user/.ssh'
-            ]" \
+            --parameters "commands=['set -e','mkdir -p /home/ec2-user/.ssh','chmod 700 /home/ec2-user/.ssh','echo ${B64_KEY} | base64 -d > /home/ec2-user/.ssh/authorized_keys','chmod 600 /home/ec2-user/.ssh/authorized_keys','chown -R ec2-user:ec2-user /home/ec2-user/.ssh']" \
             --query "Command.CommandId" \
             --output text)
 
           echo "SSM command ID: $CMD_ID"
-
-          # Poll until the command completes
-          for i in $(seq 1 15); do
+          for i in $(seq 1 20); do
             CMD_STATUS=$(aws ssm get-command-invocation \
               --command-id "$CMD_ID" \
               --instance-id "${INSTANCE_ID}" \
@@ -159,25 +141,40 @@ jobs:
               aws ssm get-command-invocation \
                 --command-id "$CMD_ID" \
                 --instance-id "${INSTANCE_ID}" \
-                --query "StandardErrorContent" \
-                --output text
-              echo "ERROR: SSM command failed"
+                --query "StandardErrorContent" --output text
               exit 1
             fi
             sleep 10
           done
-
-          echo "SSH public key successfully injected via SSM."
-      - name: Scan host key
+          echo "SSH public key injected successfully."
+      - name: Load SSH key into agent and run Ansible
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
+          # Start ssh-agent and add the private key.
+          # Using ssh-agent avoids all PEM file formatting issues (\n vs newline).
+          eval "$(ssh-agent -s)"
+
+          # The platform may store the key with literal \n or real newlines.
+          # We handle both: first try direct add; if the key has \n literals, convert.
+          KEY_FILE=$(mktemp)
+          chmod 600 "$KEY_FILE"
+          # Write with printf (preserves real newlines)
+          printf '%s' "$SSH_PRIVATE_KEY" > "$KEY_FILE"
+          # If the file is a single line (no real newlines in PEM body), convert \n literals
+          LINE_COUNT=$(wc -l < "$KEY_FILE")
+          if [ "$LINE_COUNT" -lt 3 ]; then
+            printf '%s' "$SSH_PRIVATE_KEY" | sed 's/\\n/\n/g' > "$KEY_FILE"
+          fi
+          ssh-add "$KEY_FILE"
+          rm -f "$KEY_FILE"
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          ssh-keyscan -H "${{ needs.provision.outputs.ec2_ip }}" >> ~/.ssh/known_hosts
-      - name: Run Ansible playbook
-        run: |
+          ssh-keyscan -H "${{ needs.provision.outputs.ec2_ip }}" >> ~/.ssh/known_hosts 2>/dev/null
+
           RDS_ENDPOINT=$(cat /tmp/rds_endpoint.txt)
           ansible-playbook -i "${{ needs.provision.outputs.ec2_ip }}," \
-            --private-key /tmp/deploy_key \
             -u "${{ secrets.SSH_USER }}" \
             -e "rds_endpoint=${RDS_ENDPOINT}" \
             -e "db_password=${{ secrets.DB_PASSWORD }}" \
