@@ -2,6 +2,8 @@
 # Idempotent pre-apply import script.
 # Imports AWS resources that may already exist (e.g. from a partial prior run)
 # into the current Terraform state. Safe to run even when resources don't exist yet.
+# NOTE: key pair and EC2 instance are NOT imported — they are always managed fresh
+# by Terraform so that SSH key material stays coherent with SSH_PUBLIC_KEY secret.
 set -euo pipefail
 
 PROJECT="${1:?Usage: $0 <project_name>}"
@@ -42,19 +44,12 @@ DB_SUBNET_EXISTS=$(aws rds describe-db-subnet-groups \
 [ "$DB_SUBNET_EXISTS" != "None" ] && [ -n "$DB_SUBNET_EXISTS" ] && \
   tf_import "aws_db_subnet_group.main" "${PROJECT}-db-subnet-group"
 
-# ── Key pair ──────────────────────────────────────────────────────────────────────────────
-KEY_EXISTS=$(aws ec2 describe-key-pairs \
-  --key-names "${PROJECT}-key" \
-  --query "KeyPairs[0].KeyName" --output text 2>/dev/null || true)
-[ "$KEY_EXISTS" != "None" ] && [ -n "$KEY_EXISTS" ] && \
-  tf_import "aws_key_pair.deployer" "${PROJECT}-key"
-
-# ── EC2 instance ──────────────────────────────────────────────────────────────────────────────
-EC2_ID=$(aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=${PROJECT}-app" "Name=instance-state-name,Values=running,stopped,pending" \
-  --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
-[ "$EC2_ID" != "None" ] && [ -n "$EC2_ID" ] && \
-  tf_import "aws_instance.app" "$EC2_ID"
+# ── RDS instance ───────────────────────────────────────────────────────────────────────────────
+RDS_EXISTS=$(aws rds describe-db-instances \
+  --db-instance-identifier "${PROJECT}-db" \
+  --query "DBInstances[0].DBInstanceIdentifier" --output text 2>/dev/null || true)
+[ "$RDS_EXISTS" != "None" ] && [ -n "$RDS_EXISTS" ] && \
+  tf_import "aws_db_instance.postgres" "${PROJECT}-db"
 
 # ── Elastic IP ────────────────────────────────────────────────────────────────────────────────
 EIP_ALLOC=$(aws ec2 describe-addresses \
@@ -63,11 +58,29 @@ EIP_ALLOC=$(aws ec2 describe-addresses \
 [ "$EIP_ALLOC" != "None" ] && [ -n "$EIP_ALLOC" ] && \
   tf_import "aws_eip.app" "$EIP_ALLOC"
 
-# ── RDS instance ───────────────────────────────────────────────────────────────────────────────
-RDS_EXISTS=$(aws rds describe-db-instances \
-  --db-instance-identifier "${PROJECT}-db" \
-  --query "DBInstances[0].DBInstanceIdentifier" --output text 2>/dev/null || true)
-[ "$RDS_EXISTS" != "None" ] && [ -n "$RDS_EXISTS" ] && \
-  tf_import "aws_db_instance.postgres" "${PROJECT}-db"
+# NOTE: key pair (aws_key_pair.deployer) and EC2 instance (aws_instance.app) are
+# intentionally NOT imported. If they already exist in AWS, Terraform will attempt
+# to create them, fail on the key pair name collision, and we handle that by
+# deleting the stale key pair below before apply runs.
+
+# ── Delete stale key pair so Terraform can create it fresh ────────────────────
+KEY_EXISTS=$(aws ec2 describe-key-pairs \
+  --key-names "${PROJECT}-key" \
+  --query "KeyPairs[0].KeyName" --output text 2>/dev/null || true)
+if [ "$KEY_EXISTS" = "${PROJECT}-key" ]; then
+  echo "  DELETE stale key pair: ${PROJECT}-key"
+  aws ec2 delete-key-pair --key-name "${PROJECT}-key"
+fi
+
+# ── Terminate stale EC2 so Terraform creates fresh with correct key ────────────
+EC2_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=${PROJECT}-app" "Name=instance-state-name,Values=running,stopped,pending" \
+  --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
+if [ "$EC2_ID" != "None" ] && [ -n "$EC2_ID" ]; then
+  echo "  TERMINATE stale EC2: $EC2_ID (will be recreated by Terraform with correct SSH key)"
+  aws ec2 terminate-instances --instance-ids "$EC2_ID"
+  aws ec2 wait instance-terminated --instance-ids "$EC2_ID"
+  echo "  EC2 terminated."
+fi
 
 echo "==> Import phase complete."
