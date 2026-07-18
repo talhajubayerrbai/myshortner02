@@ -71,17 +71,14 @@ resource "aws_security_group" "ec2" {
   }
 }
 
+# The RDS security group intentionally has NO inline ingress rules.
+# The cross-SG ingress rule (EC2 -> RDS on 5432) is defined as a standalone
+# aws_security_group_rule so Terraform can destroy it BEFORE destroying either
+# security group, avoiding the DependencyViolation on terraform destroy.
 resource "aws_security_group" "rds" {
   name        = "${var.project_name}-rds-sg"
   description = "Allow Postgres from EC2 only"
   vpc_id      = data.aws_vpc.default.id
-
-  ingress {
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.ec2.id]
-  }
 
   egress {
     from_port   = 0
@@ -94,6 +91,19 @@ resource "aws_security_group" "rds" {
     Project = var.project_name
     Name    = "${var.project_name}-rds-sg"
   }
+}
+
+# Standalone rule: allows EC2 instances to reach RDS on 5432.
+# As a separate resource, Terraform destroys this rule first, which removes
+# the AWS-level dependency that was blocking deletion of aws_security_group.ec2.
+resource "aws_security_group_rule" "rds_from_ec2" {
+  type                     = "ingress"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.rds.id
+  source_security_group_id = aws_security_group.ec2.id
+  description              = "Postgres from EC2 security group"
 }
 
 # ── RDS subnet group ──────────────────────────────────────────────────────────
