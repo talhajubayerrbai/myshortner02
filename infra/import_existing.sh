@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # Idempotent pre-apply import script.
-# Imports AWS resources that may already exist (e.g. from a partial prior run)
-# into the current Terraform state. Safe to run even when resources don't exist yet.
-# NOTE: key pair and EC2 instance are NOT imported — they are always managed fresh
-# by Terraform so that SSH key material stays coherent with SSH_PUBLIC_KEY secret.
+# Imports AWS resources that may already exist into the current Terraform state.
+# Safe to run even when resources don't exist yet.
 set -euo pipefail
 
 PROJECT="${1:?Usage: $0 <project_name>}"
@@ -51,19 +49,29 @@ RDS_EXISTS=$(aws rds describe-db-instances \
 [ "$RDS_EXISTS" != "None" ] && [ -n "$RDS_EXISTS" ] && \
   tf_import "aws_db_instance.postgres" "${PROJECT}-db"
 
-# ── Elastic IP ────────────────────────────────────────────────────────────────────────────────
-EIP_ALLOC=$(aws ec2 describe-addresses \
-  --filters "Name=tag:Name,Values=${PROJECT}-eip" \
-  --query "Addresses[0].AllocationId" --output text 2>/dev/null || true)
-[ "$EIP_ALLOC" != "None" ] && [ -n "$EIP_ALLOC" ] && \
-  tf_import "aws_eip.app" "$EIP_ALLOC"
+# ── IAM role ────────────────────────────────────────────────────────────────────────────────
+IAM_ROLE_EXISTS=$(aws iam get-role --role-name "${PROJECT}-ec2-ssm-role" \
+  --query "Role.RoleName" --output text 2>/dev/null || true)
+[ -n "$IAM_ROLE_EXISTS" ] && [ "$IAM_ROLE_EXISTS" != "None" ] && \
+  tf_import "aws_iam_role.ec2_ssm" "${PROJECT}-ec2-ssm-role"
 
-# NOTE: key pair (aws_key_pair.deployer) and EC2 instance (aws_instance.app) are
-# intentionally NOT imported. If they already exist in AWS, Terraform will attempt
-# to create them, fail on the key pair name collision, and we handle that by
-# deleting the stale key pair below before apply runs.
+# ── IAM instance profile ────────────────────────────────────────────────────────────────────
+IAM_PROFILE_EXISTS=$(aws iam get-instance-profile \
+  --instance-profile-name "${PROJECT}-ec2-ssm-profile" \
+  --query "InstanceProfile.InstanceProfileName" --output text 2>/dev/null || true)
+[ -n "$IAM_PROFILE_EXISTS" ] && [ "$IAM_PROFILE_EXISTS" != "None" ] && \
+  tf_import "aws_iam_instance_profile.ec2_ssm" "${PROJECT}-ec2-ssm-profile"
 
-# ── Delete stale key pair so Terraform can create it fresh ────────────────────
+# ── IAM role policy attachment ────────────────────────────────────────────────────────────
+ATTACHED=$(aws iam list-attached-role-policies --role-name "${PROJECT}-ec2-ssm-role" \
+  --query "AttachedPolicies[?PolicyArn=='arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'].PolicyArn" \
+  --output text 2>/dev/null || true)
+[ -n "$ATTACHED" ] && [ "$ATTACHED" != "None" ] && \
+  tf_import "aws_iam_role_policy_attachment.ssm_core" \
+    "${PROJECT}-ec2-ssm-role/arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+# ── Key pair ──────────────────────────────────────────────────────────────────────────────────
+# Delete stale key pair so Terraform creates it fresh with current SSH_PUBLIC_KEY.
 KEY_EXISTS=$(aws ec2 describe-key-pairs \
   --key-names "${PROJECT}-key" \
   --query "KeyPairs[0].KeyName" --output text 2>/dev/null || true)
@@ -72,15 +80,39 @@ if [ "$KEY_EXISTS" = "${PROJECT}-key" ]; then
   aws ec2 delete-key-pair --key-name "${PROJECT}-key"
 fi
 
-# ── Terminate stale EC2 so Terraform creates fresh with correct key ────────────
-EC2_ID=$(aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=${PROJECT}-app" "Name=instance-state-name,Values=running,stopped,pending" \
-  --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
-if [ "$EC2_ID" != "None" ] && [ -n "$EC2_ID" ]; then
-  echo "  TERMINATE stale EC2: $EC2_ID (will be recreated by Terraform with correct SSH key)"
-  aws ec2 terminate-instances --instance-ids "$EC2_ID"
+# ── EC2 instance: wait for any terminating instance, then decide ───────────────────────
+# If an instance with our Name tag is in running/stopped: terminate it and wait.
+# If it's already terminating/terminated: just wait for it to finish.
+# Either way, we don't import it — Terraform will create a fresh one.
+EC2_INFO=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=${PROJECT}-app" \
+  --query "Reservations[0].Instances[0].{Id:InstanceId,State:State.Name}" \
+  --output json 2>/dev/null || echo '{}')
+EC2_ID=$(echo "$EC2_INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Id',''))" 2>/dev/null || true)
+EC2_STATE=$(echo "$EC2_INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('State',''))" 2>/dev/null || true)
+
+echo "  EC2: id=$EC2_ID state=$EC2_STATE"
+
+if [ -n "$EC2_ID" ] && [ "$EC2_ID" != "None" ]; then
+  if [ "$EC2_STATE" = "running" ] || [ "$EC2_STATE" = "stopped" ] || [ "$EC2_STATE" = "pending" ]; then
+    echo "  TERMINATE EC2 $EC2_ID (state: $EC2_STATE)"
+    aws ec2 terminate-instances --instance-ids "$EC2_ID"
+  fi
+  echo "  WAIT for EC2 $EC2_ID to be fully terminated..."
   aws ec2 wait instance-terminated --instance-ids "$EC2_ID"
   echo "  EC2 terminated."
+  # Remove from Terraform state if it somehow got imported
+  terraform state rm aws_instance.app 2>/dev/null || true
 fi
+
+# ── Elastic IP ────────────────────────────────────────────────────────────────────────────────
+# Also remove EIP from state so Terraform can re-associate it to the new instance.
+terraform state rm aws_eip.app 2>/dev/null || true
+
+EIP_ALLOC=$(aws ec2 describe-addresses \
+  --filters "Name=tag:Name,Values=${PROJECT}-eip" \
+  --query "Addresses[0].AllocationId" --output text 2>/dev/null || true)
+[ "$EIP_ALLOC" != "None" ] && [ -n "$EIP_ALLOC" ] && \
+  tf_import "aws_eip.app" "$EIP_ALLOC"
 
 echo "==> Import phase complete."
