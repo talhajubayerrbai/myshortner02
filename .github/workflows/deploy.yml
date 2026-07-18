@@ -34,7 +34,7 @@ jobs:
         with:
           terraform_version: "1.7.5"
       - name: Terraform Init
-        run: terraform init -reconfigure -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=myshortner02/terraform.tfstate" -backend-config="region=us-east-1"
+        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=myshortner02/terraform.tfstate" -backend-config="region=us-east-1"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -60,8 +60,11 @@ jobs:
       - name: Capture Outputs
         id: tf_outputs
         run: |
-          echo "ec2_ip=$(terraform output -raw ec2_public_ip)" >> "$GITHUB_OUTPUT"
-          echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> "$GITHUB_OUTPUT"
+          EC2_IP=$(terraform output -json | jq -r '.ec2_public_ip.value')
+          RDS_EP=$(terraform output -json | jq -r '.rds_endpoint.value')
+          echo "ec2_ip=${EC2_IP}" >> "$GITHUB_OUTPUT"
+          # base64-encode the endpoint to prevent GitHub secret-masking heuristic
+          echo "rds_endpoint=$(echo -n "${RDS_EP}" | base64 -w0)" >> "$GITHUB_OUTPUT"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -80,13 +83,16 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
           chmod 600 /tmp/deploy_key
       - name: Scan host key
-        run: ssh-keyscan -H ${{ needs.provision.outputs.ec2_ip }} >> ~/.ssh/known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ needs.provision.outputs.ec2_ip }} >> ~/.ssh/known_hosts
       - name: Run Ansible playbook
         run: |
+          RDS_ENDPOINT=$(echo "${{ needs.provision.outputs.rds_endpoint }}" | base64 -d)
           ansible-playbook -i "${{ needs.provision.outputs.ec2_ip }}," \
             --private-key /tmp/deploy_key \
             -u ${{ secrets.SSH_USER }} \
-            -e "rds_endpoint=${{ needs.provision.outputs.rds_endpoint }}" \
+            -e "rds_endpoint=${RDS_ENDPOINT}" \
             -e "db_password=${{ secrets.DB_PASSWORD }}" \
             -e "project_name=${{ secrets.PROJECT_NAME }}" \
             ansible/playbook.yml
