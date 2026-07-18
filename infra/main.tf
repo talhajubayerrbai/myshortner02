@@ -132,18 +132,38 @@ resource "aws_db_instance" "postgres" {
   }
 }
 
+# ── IAM role for SSM (lets SSM agent talk to SSM service without extra credentials) ─
+# Amazon Linux 2023 ships with SSM agent pre-installed but the instance needs the
+# AmazonSSMManagedInstanceCore policy attached to talk back to the SSM service.
+resource "aws_iam_role" "ec2_ssm" {
+  name = "${var.project_name}-ec2-ssm-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+
+  tags = { Project = var.project_name }
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.ec2_ssm.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2_ssm" {
+  name = "${var.project_name}-ec2-ssm-profile"
+  role = aws_iam_role.ec2_ssm.name
+}
+
 # ── Key pair ──────────────────────────────────────────────────────────────────
-# The key pair is used as a fallback; the primary SSH auth is via user_data
-# which writes SSH_PUBLIC_KEY into authorized_keys on first boot — this
-# survives any key pair state drift across pipeline retries.
 resource "aws_key_pair" "deployer" {
   key_name   = "${var.project_name}-key"
   public_key = var.ssh_public_key
-
-  lifecycle {
-    # If the public key changes (e.g. platform rotates it), recreate.
-    create_before_destroy = false
-  }
 }
 
 # ── EC2 instance ──────────────────────────────────────────────────────────────
@@ -153,25 +173,7 @@ resource "aws_instance" "app" {
   subnet_id              = data.aws_subnets.default.ids[0]
   vpc_security_group_ids = [aws_security_group.ec2.id]
   key_name               = aws_key_pair.deployer.key_name
-
-  # Inject SSH public key via cloud-init so Ansible can always connect,
-  # even if the key pair resource was recreated or imported with drift.
-  user_data = <<-USERDATA
-    #!/bin/bash
-    set -e
-    mkdir -p /home/ec2-user/.ssh
-    chmod 700 /home/ec2-user/.ssh
-    cat >> /home/ec2-user/.ssh/authorized_keys <<'PUBKEY'
-${var.ssh_public_key}
-PUBKEY
-    chmod 600 /home/ec2-user/.ssh/authorized_keys
-    chown -R ec2-user:ec2-user /home/ec2-user/.ssh
-  USERDATA
-
-  lifecycle {
-    # Replace instance when user_data (SSH key) changes.
-    replace_triggered_by = [aws_key_pair.deployer]
-  }
+  iam_instance_profile   = aws_iam_instance_profile.ec2_ssm.name
 
   tags = {
     Project = var.project_name
