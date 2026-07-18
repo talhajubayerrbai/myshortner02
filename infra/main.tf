@@ -39,31 +39,20 @@ data "aws_ami" "al2023" {
 }
 
 # ── Security groups ───────────────────────────────────────────────────────────
+# revoke_rules_on_delete = true tells the AWS provider to explicitly call
+# RevokeSecurityGroupIngress / RevokeSecurityGroupEgress for every rule before
+# issuing DeleteSecurityGroup.  This removes the AWS-level "dependent object"
+# that was causing the 15-minute hang followed by DependencyViolation.
+#
+# All ingress/egress rules are also expressed as standalone
+# aws_security_group_rule resources (no inline blocks) so that Terraform's
+# dependency graph destroys the rules BEFORE the groups, giving the API time
+# to clear the references before the delete call is made.
 resource "aws_security_group" "ec2" {
-  name        = "${var.project_name}-ec2-sg"
-  description = "Allow HTTP and SSH"
-  vpc_id      = data.aws_vpc.default.id
-
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  name                   = "${var.project_name}-ec2-sg"
+  description            = "Allow HTTP and SSH"
+  vpc_id                 = data.aws_vpc.default.id
+  revoke_rules_on_delete = true
 
   tags = {
     Project = var.project_name
@@ -71,26 +60,60 @@ resource "aws_security_group" "ec2" {
   }
 }
 
+resource "aws_security_group_rule" "ec2_ingress_ssh" {
+  type              = "ingress"
+  from_port         = 22
+  to_port           = 22
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.ec2.id
+  description       = "SSH from anywhere"
+}
+
+resource "aws_security_group_rule" "ec2_ingress_http" {
+  type              = "ingress"
+  from_port         = 80
+  to_port           = 80
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.ec2.id
+  description       = "HTTP from anywhere"
+}
+
+resource "aws_security_group_rule" "ec2_egress_all" {
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.ec2.id
+  description       = "All outbound traffic"
+}
+
 # The RDS security group intentionally has NO inline ingress rules.
 # The cross-SG ingress rule (EC2 -> RDS on 5432) is defined as a standalone
 # aws_security_group_rule so Terraform can destroy it BEFORE destroying either
 # security group, avoiding the DependencyViolation on terraform destroy.
 resource "aws_security_group" "rds" {
-  name        = "${var.project_name}-rds-sg"
-  description = "Allow Postgres from EC2 only"
-  vpc_id      = data.aws_vpc.default.id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  name                   = "${var.project_name}-rds-sg"
+  description            = "Allow Postgres from EC2 only"
+  vpc_id                 = data.aws_vpc.default.id
+  revoke_rules_on_delete = true
 
   tags = {
     Project = var.project_name
     Name    = "${var.project_name}-rds-sg"
   }
+}
+
+resource "aws_security_group_rule" "rds_egress_all" {
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.rds.id
+  description       = "All outbound traffic"
 }
 
 # Standalone rule: allows EC2 instances to reach RDS on 5432.
