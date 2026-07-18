@@ -39,15 +39,6 @@ data "aws_ami" "al2023" {
 }
 
 # ── Security groups ───────────────────────────────────────────────────────────
-# revoke_rules_on_delete = true tells the AWS provider to explicitly call
-# RevokeSecurityGroupIngress / RevokeSecurityGroupEgress for every rule before
-# issuing DeleteSecurityGroup.  This removes the AWS-level "dependent object"
-# that was causing the 15-minute hang followed by DependencyViolation.
-#
-# All ingress/egress rules are also expressed as standalone
-# aws_security_group_rule resources (no inline blocks) so that Terraform's
-# dependency graph destroys the rules BEFORE the groups, giving the API time
-# to clear the references before the delete call is made.
 resource "aws_security_group" "ec2" {
   name                   = "${var.project_name}-ec2-sg"
   description            = "Allow HTTP and SSH"
@@ -90,15 +81,26 @@ resource "aws_security_group_rule" "ec2_egress_all" {
   description       = "All outbound traffic"
 }
 
-# The RDS security group intentionally has NO inline ingress rules.
-# The cross-SG ingress rule (EC2 -> RDS on 5432) is defined as a standalone
-# aws_security_group_rule so Terraform can destroy it BEFORE destroying either
-# security group, avoiding the DependencyViolation on terraform destroy.
+# The RDS security group has a cross-SG ingress rule (rds_from_ec2) that
+# references aws_security_group.ec2 as its source.  That AWS-level reference
+# is what caused the 15-minute hang + DependencyViolation: Terraform was
+# trying to delete the EC2 SG while the RDS SG still held a rule pointing at
+# it as a source.
+#
+# depends_on = [aws_security_group.ec2] fixes the destroy order:
+#   1. Terraform destroys aws_security_group.rds FIRST (it depends on ec2 SG
+#      at the Terraform level, so it is created after and destroyed before).
+#   2. revoke_rules_on_delete fires on the RDS SG, calling
+#      RevokeSecurityGroupIngress on rds_from_ec2 — removing the cross-SG
+#      reference from AWS.
+#   3. aws_security_group.ec2 is then deleted with no remaining dependents.
 resource "aws_security_group" "rds" {
   name                   = "${var.project_name}-rds-sg"
   description            = "Allow Postgres from EC2 only"
   vpc_id                 = data.aws_vpc.default.id
   revoke_rules_on_delete = true
+
+  depends_on = [aws_security_group.ec2]
 
   tags = {
     Project = var.project_name
@@ -116,9 +118,9 @@ resource "aws_security_group_rule" "rds_egress_all" {
   description       = "All outbound traffic"
 }
 
-# Standalone rule: allows EC2 instances to reach RDS on 5432.
-# As a separate resource, Terraform destroys this rule first, which removes
-# the AWS-level dependency that was blocking deletion of aws_security_group.ec2.
+# Cross-SG rule: allows EC2 instances to reach RDS on port 5432.
+# Defined as a standalone resource (no inline blocks) so Terraform's dependency
+# graph destroys this rule before either security group.
 resource "aws_security_group_rule" "rds_from_ec2" {
   type                     = "ingress"
   from_port                = 5432
@@ -165,9 +167,7 @@ resource "aws_db_instance" "postgres" {
   }
 }
 
-# ── IAM role for SSM (lets SSM agent talk to SSM service without extra credentials) ─
-# Amazon Linux 2023 ships with SSM agent pre-installed but the instance needs the
-# AmazonSSMManagedInstanceCore policy attached to talk back to the SSM service.
+# ── IAM role for SSM ─────────────────────────────────────────────────────────
 resource "aws_iam_role" "ec2_ssm" {
   name = "${var.project_name}-ec2-ssm-role"
 
