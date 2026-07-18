@@ -20,18 +20,20 @@ stages:
     kind: provision
     needs: [lint]
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.5"
       - name: Terraform Init
-        run: terraform init -reconfigure -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=myshortner02/terraform.tfstate" -backend-config="region=us-east-1"
+        run: terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=myshortner02/terraform.tfstate" -backend-config="region=us-east-1"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         working-directory: infra
       - name: Terraform Apply
-        run: terraform apply -auto-approve -var="db_password=${{ secrets.DB_PASSWORD }}" -var="project_name=${{ secrets.PROJECT_NAME }}"
+        run: terraform apply -auto-approve -var="db_password=${{ secrets.DB_PASSWORD }}" -var="project_name=${{ secrets.PROJECT_NAME }}" -var="ssh_public_key=${{ secrets.SSH_PUBLIC_KEY }}"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -50,6 +52,8 @@ stages:
     kind: configure
     needs: [provision]
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Install Ansible
         run: pip install ansible
       - name: Write SSH key
@@ -70,7 +74,7 @@ stages:
 
   - id: verify
     kind: verify
-    needs: [configure]
+    needs: [configure, provision]
     steps:
       - name: Health check
         run: |
